@@ -1,0 +1,324 @@
+Version 1 Contains code to test that the sai rl has sanity or it runs or not.
+
+# # Create connection and environment
+# sai = SAIClient(comp_id="franka-ml-hiring")
+# env = sai.make_env(render_mode="human")
+
+# # Get the initial observation
+# obs, info = env.reset()
+# done = False
+# total_reward = 0.0
+
+# while not done:
+#     # Random action for now — replace with your policy/logic later
+#     action = env.action_space.sample()
+
+#     # Step the environment
+#     obs, reward, done, truncated, info = env.step(action)
+#     # done = terminated or truncated
+    
+#     total_reward += reward
+
+#     # Optional: render to visualize (may open a window if supported)
+#     env.render()
+
+# print("Episode finished. Total reward:", total_reward)
+
+# env.close()
+
+
+
+
+Version 2. This part of the code worked before, but now we are trying to change it to work on multiple cores to increase processing speed.
+
+
+# Create connection and environment
+sai = SAIClient(comp_id="franka-ml-hiring")
+env = sai.make_env(render_mode=None)  # 'human' lets you see the simulation
+
+# Wrap environment if needed (vectorized)
+# SAC works with continuous action spaces, so vectorization is optional
+# env = make_vec_env(lambda: sai.make_env(render_mode=None), n_envs=num_envs)
+num_envs = 8
+env_fns = [lambda: sai.make_env(render_mode=None) for _ in range(num_envs)]
+env = SubprocVecEnv(env_fns)
+
+# Initialize SAC model
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = SAC("MlpPolicy", env, verbose=1, batch_size=256, learning_rate=3e-4, buffer_size=100000, device=device,
+    train_freq=(num_envs, "step"), gradient_steps=256)
+
+# Training
+total_timesteps = 200000  # adjust as needed
+model.learn(total_timesteps=total_timesteps)
+
+# Save the trained model
+model.save("sac_franka_model")
+
+# Run one episode with the trained model
+# obs, info = env.reset()
+# done = False
+# total_reward = 0.0
+
+# while not done:
+#     action, _states = model.predict(obs, deterministic=True)
+#     obs, reward, done, truncated, info = env.step(action)
+#     total_reward += reward
+#     env.render()
+
+# print("Episode finished. Total reward:", total_reward)
+
+# Close environment
+env.close()
+
+
+Version 3
+This code got us working with multiple cores but the fps is still low at 17. now we will work to increase that.
+
+from sai_rl import SAIClient
+from stable_baselines3 import SAC
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+import numpy as np
+import torch
+import multiprocessing
+
+def make_env():
+    sai = SAIClient(comp_id="franka-ml-hiring")
+    return sai.make_env(render_mode=None)
+
+def train_sac():
+    num_envs = 8
+
+    try:
+        env_fns = [make_env for _ in range(num_envs)]
+        env = SubprocVecEnv(env_fns)
+    except Exception as e:
+        print("SubprocVecEnv failed, falling back to DummyVecEnv:", e)
+        env = DummyVecEnv([make_env for _ in range(num_envs)])
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model = SAC("MlpPolicy", env, verbose=1, batch_size=256, learning_rate=3e-4, buffer_size=100_000, device=device, 
+                train_freq=(num_envs, "step"), gradient_steps=256,)
+
+    total_timesteps = 200_000
+    model.learn(total_timesteps=total_timesteps)
+    model.save("sac_franka_model")
+
+    env.close()
+
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()  
+    train_sac()
+
+
+Version 4
+No improvement, instead it hung up and didn't run
+
+
+from sai_rl import SAIClient
+from stable_baselines3 import SAC
+from stable_baselines3.common.vec_env import DummyVecEnv
+import torch
+
+def make_env():
+    # Initialize SAIClient inside each environment
+    sai = SAIClient(comp_id="franka-ml-hiring")
+    return sai.make_env(render_mode=None)  # No rendering for speed
+
+def train_sac():
+    num_envs = 8  # Vectorized environments
+
+    # Use DummyVecEnv on Windows for speed
+    env = DummyVecEnv([make_env for _ in range(num_envs)])
+
+    # Limit PyTorch CPU threads to avoid contention
+    # torch.set_num_threads(1)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Initialize SAC with tuned parameters
+    model = SAC("MlpPolicy", env, verbose=1, batch_size=1024, learning_rate=3e-4, buffer_size=100_000, device=device, 
+                gradient_steps=512, ent_coef='auto')
+
+    total_timesteps = 200_000
+    model.learn(total_timesteps=total_timesteps)
+    model.save("sac_franka_model")
+
+    env.close()
+
+if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()  # Required for Windows
+    train_sac()
+
+
+Version 5 
+We have increased the fps to 32, but have reduces the number of process to 1. Now we have to increase the process while manintaing the fps
+
+
+from sai_rl import SAIClient
+from stable_baselines3 import SAC
+from stable_baselines3.common.vec_env import DummyVecEnv
+import torch
+
+# Initialize SAIClient globally
+sai = None
+
+def make_env():
+    # Use the already created global client
+    global sai
+    if sai is None:
+        sai = SAIClient(comp_id="franka-ml-hiring")
+    return sai.make_env(render_mode=None)
+
+def train_sac():
+    num_envs = 8
+
+    # Always use DummyVecEnv on Windows to avoid spawn issues
+    env = DummyVecEnv([make_env for _ in range(num_envs)])
+
+    torch.set_num_threads(1)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model = SAC(
+        "MlpPolicy",
+        env,
+        verbose=1,
+        batch_size=1024,
+        learning_rate=3e-4,
+        buffer_size=100_000,
+        device=device,
+        train_freq=(4*num_envs, "step"),
+        gradient_steps=512,
+        ent_coef='auto'
+    )
+
+    total_timesteps = 200_000
+    model.learn(total_timesteps=total_timesteps)
+    model.save("sac_franka_model")
+
+    env.close()
+
+if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
+    train_sac()
+
+
+version 6
+code runs learned the model, but didin't do shit
+
+
+
+from sai_rl import SAIClient
+from stable_baselines3 import SAC
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
+import torch
+
+def make_env_fn():
+    def _init():    
+        # Each process initializes its own client only once
+        client = SAIClient(comp_id="franka-ml-hiring")
+        env = client.make_env(render_mode=None)
+        return env
+    return _init
+    
+num_envs = 12
+if __name__ == "__main__":
+
+    # torch.set_num_threads(1)  # Prevent thread contention
+
+    # SubprocVecEnv with multiple processes
+    env_fns = [make_env_fn() for _ in range(num_envs)]
+    env = SubprocVecEnv(env_fns)
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model = SAC(
+        "MlpPolicy",
+        env,
+        verbose=1,
+        batch_size=1024,
+        learning_rate=3e-4,
+        buffer_size=1_000_000,
+        device=device,
+        gradient_steps=1,
+        ent_coef='auto'
+    )
+
+    total_timesteps = 2_000_000
+    model.learn(total_timesteps=total_timesteps)
+    model.save("sac_franka_model")
+
+    env.close()
+
+
+    # import multiprocessing
+    # multiprocessing.freeze_support()  # Required for Windows
+    # train_sac()
+
+
+version 7
+The code now runs and has frequent checkpoints at 100k timestep. which we will now use to build the later models on.
+
+from sai_rl import SAIClient
+from stable_baselines3 import SAC
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
+from stable_baselines3.common.callbacks import CheckpointCallback
+import torch
+import os
+
+def make_env_fn():
+    def _init():    
+        # Each process initializes its own client only once
+        client = SAIClient(comp_id="franka-ml-hiring")
+        env = client.make_env(render_mode=None, deterministic_reset=True)
+        return env
+    return _init
+    
+num_envs = 12
+if __name__ == "__main__":
+
+    torch.set_num_threads(1)
+
+    # SubprocVecEnv with multiple processes
+    env_fns = [make_env_fn() for _ in range(num_envs)]
+    env = SubprocVecEnv(env_fns)
+    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.)
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    policy_kwargs = dict(
+        net_arch=dict(pi=[512, 512, 256], qf=[512, 512, 256]),
+        activation_fn=torch.nn.ReLU
+    )
+
+    model = SAC(
+        "MlpPolicy",
+        env,
+        verbose=1,
+        batch_size=1024,
+        learning_rate=3e-4,
+        buffer_size=1_000_000,
+        gradient_steps=16,
+        train_freq=(16, "step"),
+        gamma=0.99,
+        tau=0.005,
+        ent_coef='auto',
+        policy_kwargs=policy_kwargs,
+        device=device
+    )
+
+    os.makedirs("./checkpoints", exist_ok=True)
+    save_every = 100_000 // num_envs
+    checkpoint_callback = CheckpointCallback(save_freq=save_every, save_path="./checkpoints/",
+                                             name_prefix="sac_franka")
+
+    total_timesteps = 20_000_000
+    model.learn(total_timesteps=total_timesteps, callback=checkpoint_callback)
+
+    model.save("sac_franka_model")
+    env.save("vecnormalize_stats.pkl")
+    env.close()
