@@ -5,11 +5,11 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 import torch
 import os
 
+# ---------- ENV CREATION ----------
 def make_env_fn():
-    def _init():    
-        # Each process initializes its own client only once
+    def _init():
         client = SAIClient(comp_id="franka-ml-hiring")
-        env = client.make_env(render_mode=None, deterministic_reset=True)
+        env = client.make_env(render_mode=None, deterministic_reset=False)
         return env
     return _init
     
@@ -49,11 +49,11 @@ if __name__ == "__main__":
             "MlpPolicy",
             env,
             verbose=1,
-            batch_size=1024,
+            batch_size=512,
             learning_rate=3e-4,
             buffer_size=1_000_000,
-            gradient_steps=16,
-            train_freq=(16, "step"),
+            gradient_steps=2,
+            train_freq=(8, "step"),
             gamma=0.99,
             tau=0.005,
             ent_coef='auto',
